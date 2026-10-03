@@ -5,7 +5,7 @@
 
 int main() {
     try {
-        V4L2Capture capture("/dev/video0", 1920, 1080);
+        V4L2Capture capture("/dev/video1", 1920, 1080);
         ZmqSender sender("tcp://*:5555");
 
         std::cout << "Отправляю кадры на tcp://*:5555\n";
