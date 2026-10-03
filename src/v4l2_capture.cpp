@@ -13,11 +13,13 @@ int V4L2Capture::xioctl(int fd, unsigned long req, void* arg) {
     return r;
 }
 
-V4L2Capture::V4L2Capture(const std::string& device, int width, int height, int buffer_count) {
+V4L2Capture::V4L2Capture(const std::string& device, int width, int height,
+                         int fps, int buffer_count) {
     fd_ = open(device.c_str(), O_RDWR | O_NONBLOCK, 0);
     if (fd_ == -1)
         throw std::runtime_error("open(" + device + "): " + strerror(errno));
 
+    // --- Формат: MJPEG ---
     v4l2_format fmt{};
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     fmt.fmt.pix.width       = width;
@@ -27,6 +29,20 @@ V4L2Capture::V4L2Capture(const std::string& device, int width, int height, int b
     if (xioctl(fd_, VIDIOC_S_FMT, &fmt) == -1)
         throw std::runtime_error("VIDIOC_S_FMT: " + std::string(strerror(errno)));
 
+    // --- Желаемый FPS (может не поддержаться камерой) ---
+    v4l2_streamparm parm{};
+    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    parm.parm.capture.timeperframe.numerator   = 1;
+    parm.parm.capture.timeperframe.denominator = fps;
+    if (xioctl(fd_, VIDIOC_S_PARM, &parm) == -1) {
+        std::cerr << "FPS " << fps << " не поддержан камерой, использую дефолтный\n";
+    } else {
+        std::cout << "Запрошен FPS: " << fps
+                  << ", фактический: " << parm.parm.capture.timeperframe.denominator
+                  << std::endl;
+    }
+
+    // --- Запрос буферов ---
     v4l2_requestbuffers req{};
     req.count  = buffer_count;
     req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -83,7 +99,6 @@ void V4L2Capture::stopStreaming() {
 }
 
 bool V4L2Capture::waitFrame(const void** out_data, size_t* out_size, int timeout_ms) {
-    // Простейший вариант: poll с таймаутом
     fd_set fds;
     FD_ZERO(&fds);
     FD_SET(fd_, &fds);

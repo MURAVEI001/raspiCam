@@ -8,7 +8,8 @@
 // Отдаёт уже готовые JPEG-байты — без декодирования.
 class V4L2Capture {
 public:
-    V4L2Capture(const std::string& device, int width, int height, int buffer_count = 4);
+    V4L2Capture(const std::string& device, int width, int height,
+                int fps = 25, int buffer_count = 4);
     ~V4L2Capture();
 
     // Не копирует: возвращает указатель на mmap-буфер и его размер.

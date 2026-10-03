@@ -1,14 +1,22 @@
 #include "v4l2_capture.hpp"
-#include "send_frame.hpp"
+#include "zmq_sender.hpp"
 #include <iostream>
 #include <chrono>
 
 int main() {
     try {
-        V4L2Capture capture("/dev/video1", 1920, 1080);
+        // Используем стабильный путь через by-id вместо /dev/video0
+        const std::string device = "/dev/v4l/by-id/usb-Autodarts_DI_...-video-index0";
+        const int target_fps = 25;
+
+        V4L2Capture capture(device, 1920, 1080, target_fps);
         ZmqSender sender("tcp://*:5555");
 
-        std::cout << "Отправляю кадры на tcp://*:5555\n";
+        std::cout << "Отправляю кадры на tcp://*:5555 @" << target_fps << " FPS\n";
+
+        // Таймер для гарантии не более target_fps отправок в секунду
+        const auto frame_interval = std::chrono::milliseconds(1000 / target_fps);
+        auto next_send_time = std::chrono::steady_clock::now();
 
         int frames = 0;
         auto t0 = std::chrono::steady_clock::now();
@@ -18,15 +26,22 @@ int main() {
             size_t size;
             if (!capture.waitFrame(&data, &size, 1000)) continue;
 
-            sender.send(data, size);
-            capture.releaseFrame();
+            auto now = std::chrono::steady_clock::now();
+            if (now >= next_send_time) {
+                sender.send(data, size);
+                next_send_time = now + frame_interval;
 
-            if (++frames % 30 == 0) {
-                auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - t0).count();
-                std::cout << "FPS: " << 30000.0 / dt << std::endl;
-                t0 = std::chrono::steady_clock::now();
+                // Счётчик FPS
+                if (++frames % target_fps == 0) {
+                    auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    std::cout << "FPS: " << target_fps * 1000.0 / dt << std::endl;
+                    t0 = std::chrono::steady_clock::now();
+                }
             }
+            // Если ещё рано — кадр игнорируется
+
+            capture.releaseFrame();
         }
     } catch (const std::exception& e) {
         std::cerr << "Ошибка: " << e.what() << std::endl;
