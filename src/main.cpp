@@ -2,14 +2,34 @@
 #include "send_frame.hpp"
 #include <iostream>
 #include <chrono>
+#include <filesystem>
+#include <stdexcept>
+
+// Автоматически находит камеру в /dev/v4l/by-id/,
+// у которой имя оканчивается на "-video-index0".
+static std::string findCameraDevice() {
+    namespace fs = std::filesystem;
+    const std::string dir = "/dev/v4l/by-id/";
+
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        const std::string name = entry.path().filename().string();
+        const std::string suffix = "-video-index0";
+        if (name.size() >= suffix.size() &&
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            return entry.path().string();
+        }
+    }
+    throw std::runtime_error("Не найдено устройство *-video-index0 в " + dir);
+}
 
 int main() {
     try {
-        // Используем стабильный путь через by-id вместо /dev/video0
-        const std::string device = "usb-Sonix_Technology_Co.__Ltd._Autodarts_DIY_Cam_SN0001-video-index0";
+        const std::string device = findCameraDevice();
+        std::cout << "Использую камеру: " << device << std::endl;
+
         const int target_fps = 25;
 
-        V4L2Capture capture(device, 1920, 1080, target_fps);
+        V4L2Capture capture(device, 1280, 720, target_fps);
         ZmqSender sender("tcp://*:5555");
 
         std::cout << "Отправляю кадры на tcp://*:5555 @" << target_fps << " FPS\n";
@@ -31,7 +51,6 @@ int main() {
                 sender.send(data, size);
                 next_send_time = now + frame_interval;
 
-                // Счётчик FPS
                 if (++frames % target_fps == 0) {
                     auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - t0).count();
@@ -39,7 +58,6 @@ int main() {
                     t0 = std::chrono::steady_clock::now();
                 }
             }
-            // Если ещё рано — кадр игнорируется
 
             capture.releaseFrame();
         }
