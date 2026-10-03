@@ -29,7 +29,7 @@ int main() {
 
         const int target_fps = 30;
 
-        V4L2Capture capture(device, 1280, 720, target_fps);
+        V4L2Capture capture(device, 1920, 1080, target_fps);
         ZmqSender sender("tcp://*:5555");
 
         std::cout << "Отправляю кадры на tcp://*:5555 @" << target_fps << " FPS\n";
