@@ -27,7 +27,7 @@ int main() {
         const std::string device = findCameraDevice();
         std::cout << "Использую камеру: " << device << std::endl;
 
-        const int target_fps = 25;
+        const int target_fps = 30;
 
         V4L2Capture capture(device, 1280, 720, target_fps);
         ZmqSender sender("tcp://*:5555");
