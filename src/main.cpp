@@ -1,32 +1,36 @@
+#include "v4l2_capture.hpp"
 #include "send_frame.hpp"
 #include <iostream>
+#include <chrono>
 
-int main(int argc, char** argv) {
-    // В идеале — читать из config.yaml
-    std::string bind_addr = "tcp://*:5555";
-    int camera_id = (argc > 1) ? std::atoi(argv[1]) : 0;
-    
-    cv::VideoCapture cap(camera_id);
-    if (!cap.isOpened()) { std::cerr << "Камера не открылась\n"; return -1; }
-    
-    cap.set(cv::CAP_PROP_FRAME_WIDTH, 1280);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
-    
-    FrameSender sender(bind_addr);
-    cv::Mat frame;
-    std::cout << "Отправляю кадры на " << bind_addr << "\n";
-    
-// В цикле отправителя
-auto t0 = std::chrono::steady_clock::now();
-int frames = 0;
-while (true) {
-    cap >> frame;
-    sender.sendFrame(frame);
-    if (++frames % 30 == 0) {
-        auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - t0).count();
-        std::cout << "FPS: " << 30000.0 / dt << std::endl;
-        t0 = std::chrono::steady_clock::now();
+int main() {
+    try {
+        V4L2Capture capture("/dev/video0", 1920, 1080);
+        ZmqSender sender("tcp://*:5555");
+
+        std::cout << "Отправляю кадры на tcp://*:5555\n";
+
+        int frames = 0;
+        auto t0 = std::chrono::steady_clock::now();
+
+        while (true) {
+            const void* data;
+            size_t size;
+            if (!capture.waitFrame(&data, &size, 1000)) continue;
+
+            sender.send(data, size);
+            capture.releaseFrame();
+
+            if (++frames % 30 == 0) {
+                auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count();
+                std::cout << "FPS: " << 30000.0 / dt << std::endl;
+                t0 = std::chrono::steady_clock::now();
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Ошибка: " << e.what() << std::endl;
+        return 1;
     }
-}
+    return 0;
 }
