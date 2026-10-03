@@ -6,7 +6,7 @@
 int main() {
     try {
         // Используем стабильный путь через by-id вместо /dev/video0
-        const std::string device = "/dev/v4l/by-id/usb-Autodarts_DI_...-video-index0";
+        const std::string device = "usb-Sonix_Technology_Co.__Ltd._Autodarts_DIY_Cam_SN0001-video-index0";
         const int target_fps = 25;
 
         V4L2Capture capture(device, 1920, 1080, target_fps);
