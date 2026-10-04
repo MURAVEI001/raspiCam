@@ -1,0 +1,19 @@
+[Unit]
+Description=Mjpeg Streamer (RPi -> Mac)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mjpeg_streamer --config /etc/mjpeg-streamer.ini
+Restart=always
+RestartSec=1
+StandardOutput=journal
+StandardError=journal
+Nice=-10
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+CPUSchedulingPolicy=other
+
+[Install]
+WantedBy=multi-user.target

@@ -1,69 +1,137 @@
+#include "config.hpp"
 #include "v4l2_capture.hpp"
-#include "send_frame.hpp"
-#include <iostream>
+#include "tcp_sender.hpp"
+#include "log.hpp"
+
+#include <csignal>
+#include <atomic>
 #include <chrono>
-#include <filesystem>
-#include <stdexcept>
+#include <thread>
+#include <cstdio>
+#include <cstring>
 
-// Автоматически находит камеру в /dev/v4l/by-id/,
-// у которой имя оканчивается на "-video-index0".
-static std::string findCameraDevice() {
-    namespace fs = std::filesystem;
-    const std::string dir = "/dev/v4l/by-id/";
+using namespace mjpeg;
 
-    for (const auto& entry : fs::directory_iterator(dir)) {
-        const std::string name = entry.path().filename().string();
-        const std::string suffix = "-video-index0";
-        if (name.size() >= suffix.size() &&
-            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
-            return entry.path().string();
-        }
-    }
-    throw std::runtime_error("Не найдено устройство *-video-index0 в " + dir);
+static std::atomic<bool> g_stop{false};
+
+static void on_signal(int) {
+    g_stop.store(true, std::memory_order_relaxed);
 }
 
-int main() {
-    try {
-        const std::string device = findCameraDevice();
-        std::cout << "Использую камеру: " << device << std::endl;
+// Проверка: кадр должен быть валидным JPEG (SOI ... EOI).
+static bool is_valid_jpeg(const uint8_t* d, size_t n) {
+    if (n < 4) return false;
+    if (d[0] != 0xFF || d[1] != 0xD8) return false;      // SOI
+    if (d[n-2] != 0xFF || d[n-1] != 0xD9) return false;  // EOI
+    return true;
+}
 
-        const int target_fps = 30;
+int main(int argc, char** argv) {
+    std::signal(SIGINT,  on_signal);
+    std::signal(SIGTERM, on_signal);
+    std::signal(SIGPIPE, SIG_IGN); // чтобы не убивало при обрыве TCP
 
-        V4L2Capture capture(device, 1920, 1080, target_fps);
-        ZmqSender sender("tcp://*:5555");
+    std::string cfg_path = "/etc/mjpeg-streamer.ini";
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            cfg_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--help") == 0) {
+            std::printf("usage: %s [--config path]\n", argv[0]);
+            return 0;
+        }
+    }
 
-        std::cout << "Отправляю кадры на tcp://*:5555 @" << target_fps << " FPS\n";
+    Config cfg;
+    load_config(cfg_path, cfg);
 
-        // Таймер для гарантии не более target_fps отправок в секунду
-        const auto frame_interval = std::chrono::milliseconds(1000 / target_fps);
-        auto next_send_time = std::chrono::steady_clock::now();
+    LOG_INFO("config: dev=%s %dx%d@%d -> %s:%d (buffers=%d, watchdog=%dms)",
+             cfg.device.c_str(), cfg.width, cfg.height, cfg.fps,
+             cfg.server_host.c_str(), cfg.server_port,
+             cfg.buffer_count, cfg.watchdog_ms);
 
-        int frames = 0;
-        auto t0 = std::chrono::steady_clock::now();
+    V4L2Capture cam;
+    TcpSender   sender;
 
-        while (true) {
-            const void* data;
-            size_t size;
-            if (!capture.waitFrame(&data, &size, 1000)) continue;
+    // Основной цикл: если что-то падает — перезапускаем с паузой.
+    while (!g_stop.load(std::memory_order_relaxed)) {
+        // 1) Открываем камеру
+        if (!cam.open_device(cfg.device, cfg.width, cfg.height,
+                             cfg.fps, cfg.buffer_count)) {
+            LOG_ERR("open camera failed, retry in %d ms", cfg.reconnect_ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(cfg.reconnect_ms));
+            continue;
+        }
 
-            auto now = std::chrono::steady_clock::now();
-            if (now >= next_send_time) {
-                sender.send(data, size);
-                next_send_time = now + frame_interval;
+        // 2) Подключаемся к Mac
+        while (!g_stop.load(std::memory_order_relaxed)) {
+            if (sender.connect_to(cfg.server_host, cfg.server_port, 3000)) break;
+            LOG_ERR("connect failed, retry in %d ms", cfg.reconnect_ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(cfg.reconnect_ms));
+        }
+        if (g_stop.load()) break;
 
-                if (++frames % target_fps == 0) {
-                    auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - t0).count();
-                    std::cout << "FPS: " << target_fps * 1000.0 / dt << std::endl;
-                    t0 = std::chrono::steady_clock::now();
+        // 3) Горячий цикл
+        auto last_frame_time = std::chrono::steady_clock::now();
+        uint64_t frames_sent = 0;
+        uint64_t bytes_sent  = 0;
+        auto stat_time = last_frame_time;
+
+        while (!g_stop.load(std::memory_order_relaxed)) {
+            auto frame = cam.capture(1000);
+            if (!frame.data || frame.size == 0) {
+                auto idle = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - last_frame_time).count();
+                if (idle > cfg.watchdog_ms) {
+                    LOG_ERR("watchdog: no frames for %lld ms, restarting camera",
+                            static_cast<long long>(idle));
+                    break;
                 }
+                continue;
             }
 
-            capture.releaseFrame();
+            if (!is_valid_jpeg(frame.data, frame.size)) {
+                LOG_WARN("bad JPEG frame (size=%zu), dropping", frame.size);
+                cam.release();
+                continue;
+            }
+
+            bool ok = sender.send_frame(frame.data, frame.size);
+            cam.release();
+
+            if (!ok) {
+                LOG_ERR("send_frame failed: %s", strerror(errno));
+                break; // переподключимся
+            }
+
+            last_frame_time = std::chrono::steady_clock::now();
+            ++frames_sent;
+            bytes_sent += frame.size;
+
+            // Раз в секунду печатаем стату
+            auto now = std::chrono::steady_clock::now();
+            auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - stat_time).count();
+            if (since >= 1000) {
+                double mbps = (bytes_sent * 8.0) / (since / 1000.0) / 1e6;
+                LOG_INFO("fps=%.1f  mbps=%.2f  frames=%llu",
+                         frames_sent * 1000.0 / since, mbps,
+                         static_cast<unsigned long long>(frames_sent));
+                frames_sent = 0;
+                bytes_sent  = 0;
+                stat_time   = now;
+            }
         }
-    } catch (const std::exception& e) {
-        std::cerr << "Ошибка: " << e.what() << std::endl;
-        return 1;
+
+        cam.close_device();
+        sender.close();
+        if (g_stop.load()) break;
+
+        LOG_INFO("restarting pipeline in %d ms", cfg.reconnect_ms);
+        std::this_thread::sleep_for(std::chrono::milliseconds(cfg.reconnect_ms));
     }
+
+    LOG_INFO("shutting down");
+    cam.close_device();
+    sender.close();
     return 0;
 }
