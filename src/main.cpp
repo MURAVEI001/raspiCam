@@ -1,33 +1,23 @@
 /*
- * raspiCam — захват MJPG с камеры на Raspberry Pi и отправка кадров по UDP.
+ * raspiCam — прямой V4L2 MJPEG-захват и отправка по UDP.
  *
- * Сборка:
- *     mkdir -p build && cd build
- *     cmake ..
- *     make -j$(nproc)
+ * Драйвер отдаёт уже сжатый JPEG, мы его не декодируем и не перекодируем.
+ * На выходе — те же 22-байтовые заголовки и тот же протокол, что раньше.
  *
  * Запуск:
- *     ./raspiCam <camera_id> <host_ip> <port> [device] [width] [height] [fps]
+ *     ./raspiCam <camera_id> <host_ip> <port> [device] [width] [height] [fps] [quality]
  *
- * Примеры:
- *     ./raspiCam 3 192.168.1.10 5000
- *     ./raspiCam 7 192.168.1.10 6000 1 640 480 15
- *
- * Формат UDP-пакета (все многобайтовые поля — сетевой порядок байт):
- *     magic      : uint32 = 0x52415350 ("RASP")
- *     camera_id  : uint16
- *     frame_id   : uint32
- *     total_size : uint32
- *     chunk_off  : uint32
- *     chunk_len  : uint32
- *     payload    : chunk_len байт JPEG
+ * quality — 0..100, влияет на JPEG на стороне драйвера, по умолчанию 80.
  */
 
-#include <opencv2/opencv.hpp>
-
-#include <arpa/inet.h>
-#include <netinet/in.h>
+#include <linux/videodev2.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -38,77 +28,16 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace {
 
-constexpr uint32_t kMagic         = 0x52415350; // "RASP"
-constexpr int      kMaxUdpPayload = 1400;       // безопасно для Ethernet MTU 1500
-constexpr int      kDefaultFps    = 30;
-constexpr int      kDefaultWidth  = 1280;
-constexpr int      kDefaultHeight = 720;
+constexpr uint32_t kMagic         = 0x52415350;
+constexpr int      kMaxUdpPayload = 1400;
 
 std::atomic<bool> g_running{true};
+void onSignal(int) { g_running = false; }
 
-void onSignal(int) {
-    g_running = false;
-}
-
-// ---------------------------------------------------------------------------
-// RAII-обёртка для UDP-сокета.
-// ---------------------------------------------------------------------------
-class UdpSender {
-public:
-    UdpSender(const std::string& host, uint16_t port) {
-        fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
-        if (fd_ < 0) {
-            throw std::runtime_error(
-                std::string("socket() failed: ") + std::strerror(errno));
-        }
-
-        std::memset(&addr_, 0, sizeof(addr_));
-        addr_.sin_family = AF_INET;
-        addr_.sin_port   = htons(port);
-
-        if (::inet_pton(AF_INET, host.c_str(), &addr_.sin_addr) != 1) {
-            ::close(fd_);
-            fd_ = -1;
-            throw std::runtime_error("inet_pton() failed for host: " + host);
-        }
-    }
-
-    ~UdpSender() {
-        if (fd_ >= 0) ::close(fd_);
-    }
-
-    UdpSender(const UdpSender&)            = delete;
-    UdpSender& operator=(const UdpSender&) = delete;
-
-    bool send(const void* data, size_t len) {
-        const ssize_t sent = ::sendto(
-            fd_, data, len, 0,
-            reinterpret_cast<const sockaddr*>(&addr_), sizeof(addr_));
-
-        if (sent < 0) {
-            std::cerr << "[udp] sendto() error: " << std::strerror(errno) << "\n";
-            return false;
-        }
-        if (static_cast<size_t>(sent) != len) {
-            std::cerr << "[udp] partial send: " << sent << " / " << len << "\n";
-            return false;
-        }
-        return true;
-    }
-
-private:
-    int         fd_{-1};
-    sockaddr_in addr_{};
-};
-
-// ---------------------------------------------------------------------------
-// Заголовок протокола. Обязательно упакован в 22 байта.
-// ---------------------------------------------------------------------------
 #pragma pack(push, 1)
 struct FrameHeader {
     uint32_t magic;
@@ -119,65 +48,188 @@ struct FrameHeader {
     uint32_t chunk_len;
 };
 #pragma pack(pop)
-
 static_assert(sizeof(FrameHeader) == 22, "FrameHeader must be exactly 22 bytes");
 
 // ---------------------------------------------------------------------------
-// Открытие камеры с проверкой всех ключевых параметров.
-// ---------------------------------------------------------------------------
-cv::VideoCapture openCamera(int device_id, int width, int height, int fps) {
-    cv::VideoCapture cap;
+class UdpSender {
+public:
+    UdpSender(const std::string& host, uint16_t port) {
+        fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd_ < 0)
+            throw std::runtime_error(std::string("socket(): ") + std::strerror(errno));
 
-    if (!cap.open(device_id, cv::CAP_V4L2)) {
-        throw std::runtime_error(
-            "cannot open camera /dev/video" + std::to_string(device_id));
+        // Большой send buffer, чтобы sendto не блокировался при всплесках.
+        int sndbuf = 4 * 1024 * 1024;
+        ::setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+        std::memset(&addr_, 0, sizeof(addr_));
+        addr_.sin_family = AF_INET;
+        addr_.sin_port   = htons(port);
+        if (::inet_pton(AF_INET, host.c_str(), &addr_.sin_addr) != 1) {
+            ::close(fd_); fd_ = -1;
+            throw std::runtime_error("inet_pton failed for " + host);
+        }
+    }
+    ~UdpSender() { if (fd_ >= 0) ::close(fd_); }
+    UdpSender(const UdpSender&) = delete;
+    UdpSender& operator=(const UdpSender&) = delete;
+
+    bool send(const void* data, size_t len) {
+        ssize_t n = ::sendto(fd_, data, len, 0,
+                             reinterpret_cast<const sockaddr*>(&addr_), sizeof(addr_));
+        return n == static_cast<ssize_t>(len);
     }
 
-    if (!cap.isOpened()) {
-        throw std::runtime_error("camera opened but isOpened() returned false");
-    }
-
-    const uint32_t fourcc = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
-    cap.set(cv::CAP_PROP_FOURCC,        fourcc);
-    cap.set(cv::CAP_PROP_FRAME_WIDTH,   width);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT,  height);
-    cap.set(cv::CAP_PROP_FPS,           fps);
-
-    const uint32_t actual_fourcc =
-        static_cast<uint32_t>(cap.get(cv::CAP_PROP_FOURCC));
-
-    if (actual_fourcc != fourcc) {
-        char got[5] = {0, 0, 0, 0, 0};
-        std::memcpy(got, &actual_fourcc, 4);
-        throw std::runtime_error(
-            std::string("camera does not provide MJPG, got: ") + got);
-    }
-
-    const int    actual_w   = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-    const int    actual_h   = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-    const double actual_fps = cap.get(cv::CAP_PROP_FPS);
-
-    std::cout << "[cam] opened device " << device_id
-              << " | " << actual_w << "x" << actual_h
-              << " | MJPG | fps=" << actual_fps << "\n";
-
-    if (actual_w <= 0 || actual_h <= 0) {
-        throw std::runtime_error("camera returned invalid resolution");
-    }
-
-    return cap;
-}
+private:
+    int fd_{-1};
+    sockaddr_in addr_{};
+};
 
 // ---------------------------------------------------------------------------
-// Отправка одного JPEG-кадра, разбитого на UDP-датаграммы.
-// ---------------------------------------------------------------------------
-void sendFrame(UdpSender& sender,
-               uint16_t camera_id,
-               uint32_t frame_id,
-               const std::vector<uint8_t>& jpeg) {
-    const size_t total = jpeg.size();
-    if (total == 0) return;
+class V4L2MjpegCamera {
+public:
+    V4L2MjpegCamera(const std::string& dev, int w, int h, int fps, int quality) {
+        fd_ = ::open(dev.c_str(), O_RDWR | O_NONBLOCK);
+        if (fd_ < 0)
+            throw std::runtime_error("open " + dev + ": " + std::strerror(errno));
 
+        v4l2_capability cap{};
+        if (ioctl(fd_, VIDIOC_QUERYCAP, &cap) < 0)
+            fail("VIDIOC_QUERYCAP");
+        if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE))
+            fail("device is not a video capture device");
+        if (!(cap.capabilities & V4L2_CAP_STREAMING))
+            fail("device does not support streaming I/O");
+
+        v4l2_format fmt{};
+        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        fmt.fmt.pix.width       = static_cast<uint32_t>(w);
+        fmt.fmt.pix.height      = static_cast<uint32_t>(h);
+        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+        fmt.fmt.pix.field       = V4L2_FIELD_ANY;
+        if (ioctl(fd_, VIDIOC_S_FMT, &fmt) < 0) fail("VIDIOC_S_FMT");
+
+        if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_MJPEG) {
+            char fourcc[5] = {0};
+            std::memcpy(fourcc, &fmt.fmt.pix.pixelformat, 4);
+            throw std::runtime_error(
+                std::string("driver refused MJPEG, got: ") + fourcc);
+        }
+
+        // Явно попросим fps; если драйвер не умеет — не падаем, просто предупредим.
+        v4l2_streamparm parm{};
+        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        parm.parm.capture.timeperframe.numerator   = 1;
+        parm.parm.capture.timeperframe.denominator = static_cast<uint32_t>(fps);
+        if (ioctl(fd_, VIDIOC_S_PARM, &parm) < 0) {
+            std::cerr << "[cam] VIDIOC_S_PARM failed, using driver default fps\n";
+        }
+
+        // Некоторые UVC-камеры поддерживают "compression quality" (V4L2_CID_JPEG_COMPRESSION_QUALITY).
+        // Попробуем выставить, ошибку игнорируем.
+        v4l2_control ctrl{};
+        ctrl.id    = V4L2_CID_JPEG_COMPRESSION_QUALITY;
+        ctrl.value = quality;
+        ioctl(fd_, VIDIOC_S_CTRL, &ctrl);
+
+        // MMAP-буферы.
+        v4l2_requestbuffers req{};
+        req.count  = 4;
+        req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(fd_, VIDIOC_REQBUFS, &req) < 0) fail("VIDIOC_REQBUFS");
+        if (req.count < 2) fail("driver gave < 2 buffers");
+
+        bufs_.resize(req.count);
+        for (size_t i = 0; i < req.count; ++i) {
+            v4l2_buffer b{};
+            b.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            b.memory = V4L2_MEMORY_MMAP;
+            b.index  = static_cast<uint32_t>(i);
+            if (ioctl(fd_, VIDIOC_QUERYBUF, &b) < 0) fail("VIDIOC_QUERYBUF");
+
+            bufs_[i].length = b.length;
+            bufs_[i].start  = ::mmap(nullptr, b.length,
+                                     PROT_READ | PROT_WRITE,
+                                     MAP_SHARED, fd_, b.m.offset);
+            if (bufs_[i].start == MAP_FAILED) fail("mmap");
+
+            if (ioctl(fd_, VIDIOC_QBUF, &b) < 0) fail("VIDIOC_QBUF");
+        }
+
+        v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(fd_, VIDIOC_STREAMON, &type) < 0) fail("VIDIOC_STREAMON");
+
+        std::cout << "[cam] " << dev << " " << w << "x" << h
+                  << " MJPEG fps=" << fps << " quality=" << quality << "\n";
+    }
+
+    ~V4L2MjpegCamera() {
+        if (fd_ >= 0) {
+            v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            ioctl(fd_, VIDIOC_STREAMOFF, &type);
+            for (auto& b : bufs_) {
+                if (b.start && b.start != MAP_FAILED)
+                    ::munmap(b.start, b.length);
+            }
+            ::close(fd_);
+        }
+    }
+
+    V4L2MjpegCamera(const V4L2MjpegCamera&) = delete;
+    V4L2MjpegCamera& operator=(const V4L2MjpegCamera&) = delete;
+
+    // Блокируется до готовности кадра, максимум timeout_ms.
+    // Возвращает указатель на JPEG внутри mmap-буфера и его размер.
+    // После обработки обязательно вызвать release().
+    const uint8_t* capture(size_t& size, int timeout_ms) {
+        pollfd pfd{fd_, POLLIN, 0};
+        int pr = ::poll(&pfd, 1, timeout_ms);
+        if (pr <= 0) return nullptr;
+
+        v4l2_buffer b{};
+        b.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        b.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(fd_, VIDIOC_DQBUF, &b) < 0) {
+            if (errno == EAGAIN) return nullptr;
+            std::cerr << "[cam] VIDIOC_DQBUF: " << std::strerror(errno) << "\n";
+            return nullptr;
+        }
+
+        held_index_ = static_cast<int>(b.index);
+        size        = b.bytesused;
+        return static_cast<const uint8_t*>(bufs_[b.index].start);
+    }
+
+    void release() {
+        if (held_index_ < 0) return;
+        v4l2_buffer b{};
+        b.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        b.memory = V4L2_MEMORY_MMAP;
+        b.index  = static_cast<uint32_t>(held_index_);
+        if (ioctl(fd_, VIDIOC_QBUF, &b) < 0)
+            std::cerr << "[cam] VIDIOC_QBUF: " << std::strerror(errno) << "\n";
+        held_index_ = -1;
+    }
+
+private:
+    struct Buf { void* start{nullptr}; size_t length{0}; };
+
+    [[noreturn]] void fail(const char* what) {
+        const std::string err = std::strerror(errno);
+        if (fd_ >= 0) ::close(fd_);
+        fd_ = -1;
+        throw std::runtime_error(std::string(what) + ": " + err);
+    }
+
+    int              fd_{-1};
+    std::vector<Buf> bufs_;
+    int              held_index_{-1};
+};
+
+// ---------------------------------------------------------------------------
+void sendFrame(UdpSender& sender, uint16_t camera_id,
+               uint32_t frame_id, const uint8_t* jpeg, size_t total) {
     std::vector<uint8_t> packet(sizeof(FrameHeader) + kMaxUdpPayload);
 
     size_t offset = 0;
@@ -193,145 +245,106 @@ void sendFrame(UdpSender& sender,
         hdr.chunk_len  = htonl(static_cast<uint32_t>(chunk));
 
         std::memcpy(packet.data(), &hdr, sizeof(hdr));
-        std::memcpy(packet.data() + sizeof(hdr), jpeg.data() + offset, chunk);
+        std::memcpy(packet.data() + sizeof(hdr), jpeg + offset, chunk);
 
         if (!sender.send(packet.data(), sizeof(hdr) + chunk)) {
-            std::cerr << "[cam " << camera_id << "] frame " << frame_id
-                      << " chunk at offset " << offset << " failed\n";
-            return; // не рвём поток из-за одной потерянной датаграммы
+            std::cerr << "[cam " << camera_id << "] send failed at off=" << offset << "\n";
+            return;
         }
-
         offset += chunk;
     }
-}
-
-// ---------------------------------------------------------------------------
-// Основной цикл: читаем кадр, кодируем в JPEG, отправляем.
-// ---------------------------------------------------------------------------
-void captureLoop(cv::VideoCapture& cap,
-                 UdpSender& sender,
-                 uint16_t camera_id,
-                 int fps) {
-    const auto frame_interval =
-        std::chrono::microseconds(1'000'000 / std::max(1, fps));
-    auto next_deadline = std::chrono::steady_clock::now();
-
-    uint32_t frame_id = 0;
-
-    while (g_running) {
-        cv::Mat frame;
-        if (!cap.read(frame) || frame.empty()) {
-            std::cerr << "[cam " << camera_id << "] read() failed, retrying...\n";
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            continue;
-        }
-
-        // CAP_V4L2 отдаёт уже декодированный BGR-кадр. Кодируем обратно в JPEG.
-        // Для соревнований этого достаточно; для минимальной латентности
-        // можно перейти на прямой V4L2-захват с V4L2_PIX_FMT_MJPEG.
-        std::vector<uint8_t> jpeg;
-        const std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 85};
-        if (!cv::imencode(".jpg", frame, jpeg, params)) {
-            std::cerr << "[cam " << camera_id << "] imencode() failed\n";
-            continue;
-        }
-        if (jpeg.empty()) {
-            std::cerr << "[cam " << camera_id << "] empty JPEG buffer\n";
-            continue;
-        }
-
-        sendFrame(sender, camera_id, frame_id++, jpeg);
-
-        next_deadline += frame_interval;
-        const auto now = std::chrono::steady_clock::now();
-        if (next_deadline > now) {
-            std::this_thread::sleep_until(next_deadline);
-        } else {
-            next_deadline = now;
-        }
-    }
-
-    std::cout << "[cam " << camera_id << "] stopped, frames sent: "
-              << frame_id << "\n";
 }
 
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Точка входа.
-// ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::cerr
             << "Usage: " << argv[0]
-            << " <camera_id> <host_ip> <port> [device] [width] [height] [fps]\n\n"
-            << "  camera_id  : постоянный ID камеры (0..65535)\n"
-            << "  host_ip    : IP ноутбука, например 192.168.1.10\n"
-            << "  port       : UDP-порт, например 5000\n"
-            << "  device     : номер /dev/videoN (по умолчанию 0)\n"
-            << "  width      : ширина кадра (по умолчанию 1280)\n"
-            << "  height     : высота кадра (по умолчанию 720)\n"
-            << "  fps        : целевой FPS (по умолчанию 30)\n";
+            << " <camera_id> <host_ip> <port> [device] [width] [height] [fps] [quality]\n"
+            << "  device : /dev/videoN (по умолчанию 0)\n"
+            << "  width  : 1280\n"
+            << "  height : 720\n"
+            << "  fps    : 30\n"
+            << "  quality: 80 (JPEG, 0..100)\n";
         return 1;
     }
 
-    int camera_id = 0;
-    try {
-        camera_id = std::stoi(argv[1]);
-    } catch (...) {
-        std::cerr << "camera_id must be an integer\n";
-        return 1;
-    }
-    if (camera_id < 0 || camera_id > 65535) {
-        std::cerr << "camera_id must be in range 0..65535\n";
-        return 1;
-    }
+    auto parse_int = [](const char* s) -> int {
+        try { return std::stoi(s); }
+        catch (...) { throw std::runtime_error(std::string("bad int: ") + s); }
+    };
 
-    const std::string host = argv[2];
-
-    int port = 0;
-    try {
-        port = std::stoi(argv[3]);
-    } catch (...) {
-        std::cerr << "port must be an integer\n";
-        return 1;
-    }
-    if (port <= 0 || port > 65535) {
-        std::cerr << "port must be in range 1..65535\n";
-        return 1;
-    }
-
-    int device = 0, width = kDefaultWidth, height = kDefaultHeight, fps = kDefaultFps;
+    int camera_id = 0, port = 0, device = 0;
+    int width = 1280, height = 720, fps = 30, quality = 80;
+    std::string host;
 
     try {
-        if (argc > 4) device = std::stoi(argv[4]);
-        if (argc > 5) width  = std::stoi(argv[5]);
-        if (argc > 6) height = std::stoi(argv[6]);
-        if (argc > 7) fps    = std::stoi(argv[7]);
-    } catch (...) {
-        std::cerr << "device/width/height/fps must be integers\n";
+        camera_id = parse_int(argv[1]);
+        host      = argv[2];
+        port      = parse_int(argv[3]);
+        if (argc > 4) device  = parse_int(argv[4]);
+        if (argc > 5) width   = parse_int(argv[5]);
+        if (argc > 6) height  = parse_int(argv[6]);
+        if (argc > 7) fps     = parse_int(argv[7]);
+        if (argc > 8) quality = parse_int(argv[8]);
+    } catch (const std::exception& e) {
+        std::cerr << "argument error: " << e.what() << "\n";
         return 1;
     }
 
-    if (device < 0 || width <= 0 || height <= 0 || fps <= 0) {
-        std::cerr << "device must be >= 0; width, height, fps must be positive\n";
-        return 1;
-    }
+    if (camera_id < 0 || camera_id > 65535) { std::cerr << "camera_id 0..65535\n"; return 1; }
+    if (port      <= 0 || port      > 65535) { std::cerr << "port 1..65535\n"; return 1; }
+    if (device    <  0)                      { std::cerr << "device >= 0\n"; return 1; }
+    if (width <= 0 || height <= 0 || fps <= 0) { std::cerr << "w/h/fps > 0\n"; return 1; }
+    if (quality < 1 || quality > 100)         { std::cerr << "quality 1..100\n"; return 1; }
 
     std::signal(SIGINT,  onSignal);
     std::signal(SIGTERM, onSignal);
 
     try {
         UdpSender sender(host, static_cast<uint16_t>(port));
-        std::cout << "[net] UDP target: " << host << ":" << port << "\n";
+        std::cout << "[net] UDP → " << host << ":" << port << "\n";
 
-        cv::VideoCapture cap = openCamera(device, width, height, fps);
+        V4L2MjpegCamera cam("/dev/video" + std::to_string(device),
+                            width, height, fps, quality);
 
-        captureLoop(cap, sender, static_cast<uint16_t>(camera_id), fps);
+        uint32_t frame_id = 0;
+        size_t   last_size = 0;
+        auto     last_stat = std::chrono::steady_clock::now();
+        uint64_t frames_this_sec = 0;
+        uint64_t bytes_this_sec  = 0;
+
+        while (g_running) {
+            size_t size = 0;
+            const uint8_t* jpeg = cam.capture(size, 1000);
+            if (!jpeg) {
+                std::cerr << "[cam] capture timeout/error\n";
+                continue;
+            }
+
+            sendFrame(sender, static_cast<uint16_t>(camera_id), frame_id++, jpeg, size);
+            cam.release();
+
+            last_size = size;
+            ++frames_this_sec;
+            bytes_this_sec += size;
+
+            const auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_stat).count() >= 1) {
+                std::cout << "[cam " << camera_id << "] "
+                          << frames_this_sec << " fps, "
+                          << bytes_this_sec / 1024 << " KiB/s, last="
+                          << last_size << " B\n";
+                frames_this_sec = 0;
+                bytes_this_sec  = 0;
+                last_stat       = now;
+            }
+        }
     } catch (const std::exception& e) {
         std::cerr << "FATAL: " << e.what() << "\n";
         return 1;
     }
-
     return 0;
 }
