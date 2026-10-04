@@ -29,9 +29,6 @@
 //   - a frame is complete when all total_packets received
 //
 // ============================================================================
-
-#define _GNU_SOURCE
-
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
