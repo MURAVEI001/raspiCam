@@ -21,6 +21,7 @@ public:
     bool isOpen() const { return fd_ >= 0; }
 
 private:
+    void dumpSupportedFormats(const std::string& device);
     struct Buffer {
         void*  start;
         size_t length;

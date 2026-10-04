@@ -41,34 +41,66 @@ bool CameraCapture::open(const std::string& device, uint32_t width, uint32_t hei
         return false;
     }
 
-    // Установка формата MJPEG
+    // Пробуем MJPEG (UVC), при неудаче — JPEG (некоторые драйверы)
     struct v4l2_format fmt = {};
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     fmt.fmt.pix.width       = width;
     fmt.fmt.pix.height      = height;
-    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG; // OV2710 отдаёт MJPEG как JPEG
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;  // <<< ВОТ ГЛАВНОЕ ИСПРАВЛЕНИЕ
     fmt.fmt.pix.field       = V4L2_FIELD_ANY;
 
     if (ioctl(fd_, VIDIOC_S_FMT, &fmt) < 0) {
-        perror("CameraCapture::open: VIDIOC_S_FMT");
+        perror("CameraCapture::open: VIDIOC_S_FMT (MJPEG)");
+
+        // Пробуем альтернативный fourcc
+        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG;
+        if (ioctl(fd_, VIDIOC_S_FMT, &fmt) < 0) {
+            perror("CameraCapture::open: VIDIOC_S_FMT (JPEG)");
+            dumpSupportedFormats(device);   // ← сам расскажет, что умеет камера
+            close();
+            return false;
+        }
+    }
+
+    // Драйвер мог «подправить» формат — проверяем, что он реально вернул
+    uint32_t actual_fourcc = fmt.fmt.pix.pixelformat;
+    if (actual_fourcc != V4L2_PIX_FMT_MJPEG && actual_fourcc != V4L2_PIX_FMT_JPEG) {
+        fprintf(stderr,
+                "CameraCapture: драйвер вернул неожиданный формат '%c%c%c%c' "
+                "(размер %ux%u)\n",
+                (actual_fourcc      ) & 0xFF,
+                (actual_fourcc >>  8) & 0xFF,
+                (actual_fourcc >> 16) & 0xFF,
+                (actual_fourcc >> 24) & 0xFF,
+                fmt.fmt.pix.width, fmt.fmt.pix.height);
+        dumpSupportedFormats(device);
         close();
         return false;
     }
 
-    if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_JPEG) {
-        fprintf(stderr, "CameraCapture: драйвер не принял формат JPEG/MJPEG\n");
-        close();
-        return false;
-    }
+    // Логируем фактически установленные параметры
+    fprintf(stderr,
+            "CameraCapture: формат '%c%c%c%c', %ux%u, bytesperline=%u, sizeimage=%u\n",
+            (actual_fourcc      ) & 0xFF,
+            (actual_fourcc >>  8) & 0xFF,
+            (actual_fourcc >> 16) & 0xFF,
+            (actual_fourcc >> 24) & 0xFF,
+            fmt.fmt.pix.width,
+            fmt.fmt.pix.height,
+            fmt.fmt.pix.bytesperline,
+            fmt.fmt.pix.sizeimage);
 
     // Установка частоты кадров (если поддерживается)
     struct v4l2_streamparm parm = {};
     parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     parm.parm.capture.timeperframe.numerator   = 1;
     parm.parm.capture.timeperframe.denominator = fps;
-    ioctl(fd_, VIDIOC_S_PARM, &parm); // не критично, если не поддерживается
+    if (ioctl(fd_, VIDIOC_S_PARM, &parm) < 0) {
+        // Не критично — многие UVC-камеры не дают менять FPS через этот интерфейс.
+        fprintf(stderr, "CameraCapture: VIDIOC_S_PARM не поддержан, используется FPS по умолчанию\n");
+    }
 
-    // Запрос буферов (4 буфера достаточно для сглаживания)
+    // Запрос буферов
     struct v4l2_requestbuffers req = {};
     req.count  = 4;
     req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -80,22 +112,68 @@ bool CameraCapture::open(const std::string& device, uint32_t width, uint32_t hei
         return false;
     }
     if (req.count < 2) {
-        fprintf(stderr, "CameraCapture: недостаточно буферов\n");
+        fprintf(stderr, "CameraCapture: недостаточно буферов (%u)\n", req.count);
         close();
         return false;
     }
 
-    if (!initMmap()) {
-        close();
-        return false;
-    }
-
-    if (!startStreaming()) {
-        close();
-        return false;
-    }
+    if (!initMmap()) { close(); return false; }
+    if (!startStreaming()) { close(); return false; }
 
     return true;
+}
+
+void CameraCapture::dumpSupportedFormats(const std::string& device) {
+    fprintf(stderr, "\n=== Поддерживаемые форматы на %s ===\n", device.c_str());
+
+    struct v4l2_fmtdesc fmtdesc = {};
+    fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+    for (fmtdesc.index = 0; ; ++fmtdesc.index) {
+        if (ioctl(fd_, VIDIOC_ENUM_FMT, &fmtdesc) < 0) break;
+
+        uint32_t f = fmtdesc.pixelformat;
+        fprintf(stderr, "[%u] '%c%c%c%c'  %s\n",
+                fmtdesc.index,
+                (f      ) & 0xFF,
+                (f >>  8) & 0xFF,
+                (f >> 16) & 0xFF,
+                (f >> 24) & 0xFF,
+                fmtdesc.description);
+
+        // Перечисляем размеры для этого формата
+        struct v4l2_frmsizeenum frmsize = {};
+        frmsize.pixel_format = f;
+        for (frmsize.index = 0; ; ++frmsize.index) {
+            if (ioctl(fd_, VIDIOC_ENUM_FRAMESIZES, &frmsize) < 0) break;
+
+            if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+                fprintf(stderr, "     %ux%u\n",
+                        frmsize.discrete.width, frmsize.discrete.height);
+
+                // И FPS для каждого размера
+                struct v4l2_frmivalenum frmival = {};
+                frmival.pixel_format = f;
+                frmival.width  = frmsize.discrete.width;
+                frmival.height = frmsize.discrete.height;
+                for (frmival.index = 0; ; ++frmival.index) {
+                    if (ioctl(fd_, VIDIOC_ENUM_FRAMEINTERVALS, &frmival) < 0) break;
+                    if (frmival.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
+                        if (frmival.discrete.numerator != 0) {
+                            double fps_val = (double)frmival.discrete.denominator
+                                           / (double)frmival.discrete.numerator;
+                            fprintf(stderr, "        %.2f fps\n", fps_val);
+                        }
+                    }
+                }
+            } else if (frmsize.type == V4L2_FRMSIZE_TYPE_STEPWISE) {
+                fprintf(stderr, "     stepwise: %ux%u .. %ux%u\n",
+                        frmsize.stepwise.min_width,  frmsize.stepwise.min_height,
+                        frmsize.stepwise.max_width,  frmsize.stepwise.max_height);
+            }
+        }
+    }
+    fprintf(stderr, "=====================================\n\n");
 }
 
 void CameraCapture::close() {
