@@ -1,26 +1,24 @@
-cmake_minimum_required(VERSION 3.16)
-project(rpi_mjpeg_streamer CXX)
+cmake_minimum_required(VERSION 3.10)
+project(raspiCam CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -pipe -march=armv8-a+crc -mtune=cortex-a53 -flto")
-set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-flto -Wl,-O1")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=armv8-a -mtune=cortex-a53 -mfpu=neon-fp-armv8 -mfloat-abi=hard")
 
-add_executable(mjpeg_streamer
+find_package(Threads REQUIRED)
+
+add_executable(raspiCam
     src/main.cpp
-    src/v4l2_capture.cpp
-    src/tcp_sender.cpp
-    src/config.cpp
+    src/CameraCapture.cpp
+    src/FrameSender.cpp
 )
 
-target_include_directories(mjpeg_streamer PRIVATE src)
+target_link_libraries(raspiCam PRIVATE Threads::Threads)
 
-# Для линковки с pthread (нужно для std::thread)
-find_package(Threads REQUIRED)
-target_link_libraries(mjpeg_streamer PRIVATE Threads::Threads)
+# Для Raspberry Pi 3 (armv7) флаги могут отличаться:
+# -march=armv7-a -mtune=cortex-a53 -mfpu=neon-vfpv4 -mfloat-abi=hard
