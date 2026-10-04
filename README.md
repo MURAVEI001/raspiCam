@@ -11,3 +11,9 @@ sudo apt install -y build-essential cmake
 mkdir build && cd build
 cmake ..
 make -j4
+
+# плата с 1 камерой
+./raspiCam 192.168.2.1 9000 front=/dev/video0
+
+# плата с 2 камерами
+./raspiCam 192.168.2.1 9000 turret=/dev/video0 turret_wide=/dev/video2

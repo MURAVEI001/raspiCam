@@ -8,78 +8,115 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <string>
+#include <vector>
 
 static std::atomic<bool> g_running{true};
 
-void signalHandler(int) {
-    g_running = false;
-}
+static void signalHandler(int) { g_running = false; }
 
-int main(int argc, char** argv) {
-    if (argc < 4) {
-        fprintf(stderr, "Usage: %s <server_ip> <server_port> <video_device>\n", argv[0]);
-        fprintf(stderr, "Example: %s 192.168.1.100 9000 /dev/video0\n", argv[0]);
-        return 1;
-    }
+struct CameraJob {
+    std::string name;
+    std::string device;
+    std::string server_ip;
+    uint16_t    server_port;
+};
 
-    const char* server_ip   = argv[1];
-    uint16_t    server_port = static_cast<uint16_t>(std::atoi(argv[2]));
-    const char* device      = argv[3];
-
-    // Настройка обработки сигналов
-    signal(SIGINT,  signalHandler);
-    signal(SIGTERM, signalHandler);
-
+static void cameraWorker(CameraJob job) {
     CameraCapture camera;
-    if (!camera.open(device, 1920, 1080, 30)) {
-        fprintf(stderr, "Не удалось открыть камеру %s\n", device);
-        return 1;
+    if (!camera.open(job.device, 1920, 1080, 30)) {
+        fprintf(stderr, "[%s] не удалось открыть %s\n",
+                job.name.c_str(), job.device.c_str());
+        return;
     }
 
     FrameSender sender;
-    if (!sender.connect(server_ip, server_port)) {
-        fprintf(stderr, "Не удалось подключиться к %s:%u\n", server_ip, server_port);
-        return 1;
+    if (!sender.connect(job.server_ip, job.server_port, job.name)) {
+        fprintf(stderr, "[%s] не удалось подключиться к %s:%u\n",
+                job.name.c_str(), job.server_ip.c_str(), job.server_port);
+        return;
     }
 
-    printf("raspiCam запущен. Отправка кадров на %s:%u\n", server_ip, server_port);
-
-    uint64_t frame_count = 0;
-    auto last_report = std::chrono::steady_clock::now();
+    printf("[%s] запущена (%s)\n", job.name.c_str(), job.device.c_str());
 
     while (g_running) {
         const uint8_t* data = nullptr;
         size_t size = 0;
 
         if (!camera.capture(&data, &size)) {
-            // Нет кадра — короткая пауза, чтобы не жечь CPU
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
-
         if (size == 0) continue;
 
         if (!sender.sendFrame(data, size)) {
-            fprintf(stderr, "Ошибка отправки кадра, попытка переподключения...\n");
+            fprintf(stderr, "[%s] ошибка отправки, переподключение...\n",
+                    job.name.c_str());
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            if (!sender.connect(server_ip, server_port)) {
-                fprintf(stderr, "Переподключение не удалось, выход.\n");
+            if (!sender.connect(job.server_ip, job.server_port, job.name)) {
+                fprintf(stderr, "[%s] переподключение не удалось, стоп.\n",
+                        job.name.c_str());
                 break;
             }
-        }
-
-        ++frame_count;
-
-        // Отчёт раз в секунду
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= 1) {
-            printf("Отправлено кадров: %llu\n", (unsigned long long)frame_count);
-            last_report = now;
         }
     }
 
     camera.close();
     sender.close();
+}
+
+int main(int argc, char** argv) {
+    if (argc < 4) {
+        fprintf(stderr,
+            "Usage: %s <server_ip> <server_port> <name>=<device> [<name>=<device> ...]\n",
+            argv[0]);
+        fprintf(stderr,
+            "Example (1 camera):    %s 192.168.2.1 9000 front=/dev/video0\n",
+            argv[0]);
+        fprintf(stderr,
+            "Example (2 cameras):   %s 192.168.2.1 9000 left=/dev/video0 right=/dev/video2\n",
+            argv[0]);
+        return 1;
+    }
+
+    std::string server_ip   = argv[1];
+    uint16_t    server_port = static_cast<uint16_t>(std::atoi(argv[2]));
+
+    std::vector<CameraJob> jobs;
+    for (int i = 3; i < argc; ++i) {
+        std::string arg = argv[i];
+        auto eq = arg.find('=');
+        if (eq == std::string::npos || eq == 0 || eq == arg.size() - 1) {
+            fprintf(stderr, "Неверный аргумент: '%s' (ожидается name=device)\n",
+                    arg.c_str());
+            return 1;
+        }
+        CameraJob job;
+        job.name        = arg.substr(0, eq);
+        job.device      = arg.substr(eq + 1);
+        job.server_ip   = server_ip;
+        job.server_port = server_port;
+        jobs.push_back(std::move(job));
+    }
+
+    if (jobs.empty()) {
+        fprintf(stderr, "Не задано ни одной камеры\n");
+        return 1;
+    }
+
+    signal(SIGINT,  signalHandler);
+    signal(SIGTERM, signalHandler);
+
+    printf("raspiCam: запускаю %zu камер(ы) -> %s:%u\n",
+           jobs.size(), server_ip.c_str(), server_port);
+
+    std::vector<std::thread> threads;
+    threads.reserve(jobs.size());
+    for (auto& job : jobs) {
+        threads.emplace_back(cameraWorker, job);
+    }
+    for (auto& t : threads) t.join();
+
     printf("raspiCam завершён.\n");
     return 0;
 }
