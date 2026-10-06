@@ -5,9 +5,17 @@
  * На выходе — те же 22-байтовые заголовки и тот же протокол, что раньше.
  *
  * Запуск:
- *     ./raspiCam <camera_id> <host_ip> <port> [device] [width] [height] [fps] [quality]
+ *     ./raspiCam <camera_id> <host_ip> <port>
+ *                [device] [width] [height] [fps] [quality] [exposure] [gain]
  *
- * quality — 0..100, влияет на JPEG на стороне драйвера, по умолчанию 80.
+ * quality  — 0..100, влияет на JPEG на стороне драйвера, по умолчанию 80.
+ * exposure — значение V4L2_CID_EXPOSURE_ABSOLUTE, -1 = не трогать (авто).
+ * gain     — значение V4L2_CID_GAIN,               -1 = не трогать (авто).
+ *
+ * Порядок аргументов после port:
+ *     device width height fps quality exposure gain
+ *     /dev/videoN — по умолчанию 0
+ *     width=1280 height=720 fps=30 quality=80 exposure=-1 gain=-1
  */
 
 #include <linux/videodev2.h>
@@ -88,7 +96,9 @@ private:
 // ---------------------------------------------------------------------------
 class V4L2MjpegCamera {
 public:
-    V4L2MjpegCamera(const std::string& dev, int w, int h, int fps, int quality) {
+    V4L2MjpegCamera(const std::string& dev, int w, int h, int fps, int quality,
+                    int exposure = -1, int gain = -1)
+    {
         fd_ = ::open(dev.c_str(), O_RDWR | O_NONBLOCK);
         if (fd_ < 0)
             throw std::runtime_error("open " + dev + ": " + std::strerror(errno));
@@ -125,12 +135,105 @@ public:
             std::cerr << "[cam] VIDIOC_S_PARM failed, using driver default fps\n";
         }
 
-        // Некоторые UVC-камеры поддерживают "compression quality" (V4L2_CID_JPEG_COMPRESSION_QUALITY).
-        // Попробуем выставить, ошибку игнорируем.
-        v4l2_control ctrl{};
-        ctrl.id    = V4L2_CID_JPEG_COMPRESSION_QUALITY;
-        ctrl.value = quality;
-        ioctl(fd_, VIDIOC_S_CTRL, &ctrl);
+        // --- JPEG quality (некоторые UVC-камеры поддерживают) ---
+        if (quality > 0) {
+            v4l2_control ctrl{};
+            ctrl.id    = V4L2_CID_JPEG_COMPRESSION_QUALITY;
+            ctrl.value = quality;
+            if (ioctl(fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
+                std::cerr << "[cam] JPEG quality not supported (ignored)\n";
+            } else {
+                std::cout << "[cam] jpeg quality = " << quality << "\n";
+            }
+        }
+
+        // --- Exposure ---
+        // exposure < 0  -> оставляем авторежим.
+        // exposure >= 0 -> ручной режим с указанным значением.
+        if (exposure >= 0) {
+            // Шаг 1: отключаем авто-выдержку.
+            v4l2_control auto_ctrl{};
+            auto_ctrl.id    = V4L2_CID_EXPOSURE_AUTO;
+            auto_ctrl.value = V4L2_EXPOSURE_MANUAL;
+            if (ioctl(fd_, VIDIOC_S_CTRL, &auto_ctrl) < 0) {
+                std::cerr << "[cam] VIDIOC_S_CTRL(EXPOSURE_AUTO=MANUAL) failed: "
+                          << std::strerror(errno)
+                          << " — камера может не поддерживать ручную выдержку\n";
+            }
+
+            // Шаг 2: узнаём допустимый диапазон (у разных камер он разный).
+            v4l2_queryctrl q{};
+            q.id = V4L2_CID_EXPOSURE_ABSOLUTE;
+            if (ioctl(fd_, VIDIOC_QUERYCTRL, &q) == 0 &&
+                !(q.flags & V4L2_CTRL_FLAG_DISABLED))
+            {
+                int val = exposure;
+                if (val < q.minimum) val = q.minimum;
+                if (val > q.maximum) val = q.maximum;
+                if (q.step > 1)
+                    val = q.minimum + ((val - q.minimum) / q.step) * q.step;
+
+                v4l2_control exp_ctrl{};
+                exp_ctrl.id    = V4L2_CID_EXPOSURE_ABSOLUTE;
+                exp_ctrl.value = val;
+                if (ioctl(fd_, VIDIOC_S_CTRL, &exp_ctrl) < 0) {
+                    std::cerr << "[cam] VIDIOC_S_CTRL(EXPOSURE_ABSOLUTE=" << val
+                              << ") failed: " << std::strerror(errno) << "\n";
+                } else {
+                    std::cout << "[cam] exposure = " << val
+                              << " (range " << q.minimum << ".." << q.maximum
+                              << ", step "   << q.step
+                              << ", default " << q.default_value << ")\n";
+                }
+            } else {
+                std::cerr << "[cam] EXPOSURE_ABSOLUTE not supported by this camera\n";
+            }
+        }
+
+        // --- Gain ---
+        // gain < 0  -> авто.
+        // gain >= 0 -> ручной.
+        //
+        // ВАЖНО: у UVC-камер обычно есть ДВА контрола:
+        //   V4L2_CID_AUTOGAIN  — вкл/выкл автоматики (0/1)
+        //   V4L2_CID_GAIN      — само значение усиления
+        // Отключаем авто, потом ставим значение.
+        if (gain >= 0) {
+            v4l2_control autogain{};
+            autogain.id    = V4L2_CID_AUTOGAIN;
+            autogain.value = 0;   // 0 = manual
+            if (ioctl(fd_, VIDIOC_S_CTRL, &autogain) < 0) {
+                std::cerr << "[cam] VIDIOC_S_CTRL(AUTOGAIN=0) failed: "
+                          << std::strerror(errno) << "\n";
+            }
+
+            v4l2_queryctrl qg{};
+            qg.id = V4L2_CID_GAIN;
+            if (ioctl(fd_, VIDIOC_QUERYCTRL, &qg) == 0 &&
+                !(qg.flags & V4L2_CTRL_FLAG_DISABLED))
+            {
+                int val = gain;
+                if (val < qg.minimum) val = qg.minimum;
+                if (val > qg.maximum) val = qg.maximum;
+                if (qg.step > 1)
+                    val = qg.minimum + ((val - qg.minimum) / qg.step) * qg.step;
+
+                v4l2_control gctrl{};
+                gctrl.id    = V4L2_CID_GAIN;
+                gctrl.value = val;
+                if (ioctl(fd_, VIDIOC_S_CTRL, &gctrl) < 0) {
+                    std::cerr << "[cam] VIDIOC_S_CTRL(GAIN=" << val
+                              << ") failed: " << std::strerror(errno) << "\n";
+                } else {
+                    std::cout << "[cam] gain = " << val
+                              << " (range " << qg.minimum << ".." << qg.maximum
+                              << ", step "  << qg.step
+                              << ", default " << qg.default_value << ")\n";
+                }
+            } else {
+                std::cerr << "[cam] GAIN not supported by this camera\n";
+            }
+        }
 
         // MMAP-буферы.
         v4l2_requestbuffers req{};
@@ -161,7 +264,11 @@ public:
         if (ioctl(fd_, VIDIOC_STREAMON, &type) < 0) fail("VIDIOC_STREAMON");
 
         std::cout << "[cam] " << dev << " " << w << "x" << h
-                  << " MJPEG fps=" << fps << " quality=" << quality << "\n";
+                  << " MJPEG fps=" << fps
+                  << " quality=" << quality
+                  << " exposure=" << (exposure >= 0 ? std::to_string(exposure) : "auto")
+                  << " gain="     << (gain     >= 0 ? std::to_string(gain)     : "auto")
+                  << "\n";
     }
 
     ~V4L2MjpegCamera() {
@@ -262,12 +369,15 @@ int main(int argc, char** argv) {
     if (argc < 4) {
         std::cerr
             << "Usage: " << argv[0]
-            << " <camera_id> <host_ip> <port> [device] [width] [height] [fps] [quality]\n"
-            << "  device : /dev/videoN (по умолчанию 0)\n"
-            << "  width  : 1280\n"
-            << "  height : 720\n"
-            << "  fps    : 30\n"
-            << "  quality: 80 (JPEG, 0..100)\n";
+            << " <camera_id> <host_ip> <port>\n"
+            << "       [device] [width] [height] [fps] [quality] [exposure] [gain]\n"
+            << "  device  : /dev/videoN (по умолчанию 0)\n"
+            << "  width   : 1280\n"
+            << "  height  : 720\n"
+            << "  fps     : 30\n"
+            << "  quality : 80 (JPEG, 0..100)\n"
+            << "  exposure: значение V4L2_CID_EXPOSURE_ABSOLUTE, -1 = авто (по умолчанию)\n"
+            << "  gain    : значение V4L2_CID_GAIN,               -1 = авто (по умолчанию)\n";
         return 1;
     }
 
@@ -278,17 +388,21 @@ int main(int argc, char** argv) {
 
     int camera_id = 0, port = 0, device = 0;
     int width = 1280, height = 720, fps = 30, quality = 80;
+    int exposure = -1;
+    int gain     = -1;
     std::string host;
 
     try {
         camera_id = parse_int(argv[1]);
         host      = argv[2];
         port      = parse_int(argv[3]);
-        if (argc > 4) device  = parse_int(argv[4]);
-        if (argc > 5) width   = parse_int(argv[5]);
-        if (argc > 6) height  = parse_int(argv[6]);
-        if (argc > 7) fps     = parse_int(argv[7]);
-        if (argc > 8) quality = parse_int(argv[8]);
+        if (argc > 4)  device   = parse_int(argv[4]);
+        if (argc > 5)  width    = parse_int(argv[5]);
+        if (argc > 6)  height   = parse_int(argv[6]);
+        if (argc > 7)  fps      = parse_int(argv[7]);
+        if (argc > 8)  quality  = parse_int(argv[8]);
+        if (argc > 9)  exposure = parse_int(argv[9]);
+        if (argc > 10) gain     = parse_int(argv[10]);
     } catch (const std::exception& e) {
         std::cerr << "argument error: " << e.what() << "\n";
         return 1;
@@ -298,7 +412,9 @@ int main(int argc, char** argv) {
     if (port      <= 0 || port      > 65535) { std::cerr << "port 1..65535\n"; return 1; }
     if (device    <  0)                      { std::cerr << "device >= 0\n"; return 1; }
     if (width <= 0 || height <= 0 || fps <= 0) { std::cerr << "w/h/fps > 0\n"; return 1; }
-    if (quality < 1 || quality > 100)         { std::cerr << "quality 1..100\n"; return 1; }
+    if (quality < 0 || quality > 100)         { std::cerr << "quality 0..100\n"; return 1; }
+    if (exposure < -1)                        { std::cerr << "exposure >= -1\n"; return 1; }
+    if (gain     < -1)                        { std::cerr << "gain >= -1\n"; return 1; }
 
     std::signal(SIGINT,  onSignal);
     std::signal(SIGTERM, onSignal);
@@ -308,7 +424,7 @@ int main(int argc, char** argv) {
         std::cout << "[net] UDP → " << host << ":" << port << "\n";
 
         V4L2MjpegCamera cam("/dev/video" + std::to_string(device),
-                            width, height, fps, quality);
+                            width, height, fps, quality, exposure, gain);
 
         uint32_t frame_id = 0;
         size_t   last_size = 0;
